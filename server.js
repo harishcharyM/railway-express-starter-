@@ -2,6 +2,9 @@
 // Minimal MQTT broker over WebSockets
 // Works on Railway: binds to process.env.PORT and serves MQTT over ws://<host>/mqtt
 
+const TOPIC = 'demo/topic';
+const MESSAGE = 'HarishcharyM';
+
 require('dotenv').config();
 const http = require('http');
 const ws = require('ws');
@@ -58,3 +61,12 @@ server.listen(PORT, () => {
   console.log(`HTTP/WebSocket server listening on PORT=${PORT}`);
   console.log(`WebSocket MQTT endpoint: ws(s)://<your-host>/mqtt`);
 });
+
+
+aedes.publish({ topic: TOPIC, payload: MESSAGE, qos: 0, retain: false }, (err) => {
+    if (err) {
+      console.error('Startup publish error:', err);
+    } else {
+      console.log(`Startup publish: "${MESSAGE}" -> ${TOPIC}`);
+    }
+
