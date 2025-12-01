@@ -69,4 +69,5 @@ aedes.publish({ topic: TOPIC, payload: MESSAGE, qos: 0, retain: false }, (err) =
     } else {
       console.log(`Startup publish: "${MESSAGE}" -> ${TOPIC}`);
     }
+});
 
