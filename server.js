@@ -14,6 +14,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 // upload API (field name: 'file')
+const app = express();
 app.post('/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   const fileUrl = `/files/${encodeURIComponent(req.file.filename)}`;
