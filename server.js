@@ -1,29 +1,60 @@
 
-const fs = require('fs');
-const path = require('path');
-const multer = require('multer');
-// ensure uploads dir
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+// Minimal MQTT broker over WebSockets
+// Works on Railway: binds to process.env.PORT and serves MQTT over ws://<host>/mqtt
 
-// multer config
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => cb(null, file.originalname) // keep original name
+require('dotenv').config();
+const http = require('http');
+const ws = require('ws');
+const morgan = require('morgan');
+const aedes = require('aedes')();
+
+const PORT = process.env.PORT || 3000;
+
+// Basic logging for broker events
+aedes.on('client', (client) => {
+  console.log(`[MQTT] Client connected: ${client ? client.id : '(no-id)'}`);
 });
-const upload = multer({ storage });
-
-// upload API (field name: 'file')
-const app = express();
-app.post('/upload', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  const fileUrl = `/files/${encodeURIComponent(req.file.filename)}`;
-  res.json({ ok: true, filename: req.file.filename, size: req.file.size, url: fileUrl });
+aedes.on('clientDisconnect', (client) => {
+  console.log(`[MQTT] Client disconnected: ${client ? client.id : '(no-id)'}`);
+});
+aedes.on('subscribe', (subs, client) => {
+  console.log(`[MQTT] ${client && client.id} subscribed: ${subs.map(s => s.topic).join(', ')}`);
+});
+aedes.on('publish', (packet, client) => {
+  if (client) {
+    console.log(`[MQTT] ${client.id} published to ${packet.topic}: ${packet.payload.toString()}`);
+  }
 });
 
-// serve uploaded files
-app.get('/files/:filename', (req, res) => {
-  const filePath = path.join(uploadsDir, req.params.filename);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
-  res.sendFile(filePath);
+// Create an HTTP server (required for WebSocket)
+const server = http.createServer((req, res) => {
+  // Optional: health endpoint for Railway
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
+  }
+  // Simple info page
+  if (req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('MQTT WebSocket broker running. Connect via ws(s)://<your-host>/mqtt');
+    return;
+  }
+  res.writeHead(404);
+  res.end('Not found');
+});
+
+// Attach WebSocket server at path /mqtt and wire to Aedes
+const wss = new ws.Server({ server, path: '/mqtt' });
+wss.on('connection', function connection(wsClient) {
+  const stream = ws.createWebSocketStream(wsClient);
+  aedes.handle(stream);
+});
+
+// Optional logging for HTTP requests via morgan-like
+server.on('request', morgan('dev'));
+
+server.listen(PORT, () => {
+  console.log(`HTTP/WebSocket server listening on PORT=${PORT}`);
+  console.log(`WebSocket MQTT endpoint: ws(s)://<your-host>/mqtt`);
 });
