@@ -1,22 +1,19 @@
 
 {
-  "name": "railway-node-root-starter-upload",
+  "name": "mqtt-ws-broker",
   "version": "1.0.0",
-  "description": "Express server with user-settable app name and file upload",
+  "description": "Minimal MQTT broker over WebSockets for Railway",
   "type": "commonjs",
   "main": "server.js",
   "scripts": {
-    "dev": "nodemon server.js",
     "start": "node server.js"
   },
   "engines": { "node": ">=18" },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "aedes": "^0.51.0",
+    "ws": "^8.18.0",
+    "http": "0.0.1-security",
     "morgan": "^1.10.0",
-    "multer": "^1.4.5-lts.1"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "dotenv": "^16.4.5"
   }
 }
