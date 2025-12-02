@@ -26,6 +26,14 @@ aedes.on('subscribe', (subs, client) => {
 aedes.on('publish', (packet, client) => {
   if (client) {
     console.log(`[MQTT] ${client.id} published to ${packet.topic}: ${packet.payload.toString()}`);
+    if (packet.payload.toString() == "Am- ready") {
+      aedes.publish({ topic: TOPIC, payload: MESSAGE, qos: 0, retain: false }, (err) => {
+    if (err) {
+      console.error('Startup publish error:', err);
+    } else {
+      console.log(`Startup publish: "${MESSAGE}" -> ${TOPIC}`);
+    }
+});
   }
 });
 
