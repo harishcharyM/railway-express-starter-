@@ -36,6 +36,7 @@ aedes.on('publish', (packet, client) => {
 });
   }
 });
+});
 
 // Create an HTTP server (required for WebSocket)
 const server = http.createServer((req, res) => {
