@@ -16,10 +16,10 @@
 
 require('dotenv').config();
 
-const http   = require('http');   // built-in HTTP server
-const ws     = require('ws');     // WebSocket server
-const aedes  = require('aedes')();// MQTT broker
-const morgan = require('morgan'); // HTTP request logging (optional)
+const http   = require('http');      // built-in HTTP server
+const ws     = require('ws');        // WebSocket server
+const aedes  = require('aedes')();   // MQTT broker
+const morgan = require('morgan');    // HTTP request logging (optional)
 
 const PORT    = process.env.PORT || 3000; // Railway injects PORT
 const WS_PATH = '/mqtt';
@@ -104,7 +104,8 @@ const server = http.createServer((req, res) => {
   // Health check
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok' }));
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
   }
 
   // JSON API: current device statuses
@@ -115,17 +116,18 @@ const server = http.createServer((req, res) => {
       updatedAt: info.updatedAt
     }));
     res.writeHead(200, {
-      'Content-Type': 'application/json',
-      // If you serve /devices from another host, uncomment the CORS line below:
-      // 'Access-Control-Allow-Origin': '*'
+      'Content-Type': 'application/json'
+      // If you serve /devices from another host, enable CORS:
+      // ,'Access-Control-Allow-Origin': '*'
     });
-    return res.end(JSON.stringify({ items, count: items.length }));
+    res.end(JSON.stringify({ items, count: items.length }));
+    return;
   }
 
   // HTML UI: auto-refreshing table (5 seconds)
   if (req.method === 'GET' && req.url === '/devices') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    return res.end(`<!doctype html>
+    const html =
+`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -171,22 +173,23 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        let html = '';
-        for (const x of items) {
-          const dev = escapeHtml(x.device || '');
-          const st  = String(x.status || '').toLowerCase();
-          const cls = st === 'online' ? 'online' : (st === 'offline' ? 'offline' : 'unknown');
-          const upd = escapeHtml(x.updatedAt || '');
-          html += '<tr>'
-               + '<td>' + dev + '</td>'
-               + '<td><span class="badge ' + cls + '">' + escapeHtml(x.status || '') + '</span></td>'
-               + '<td>' + upd + '</td>'
-               + '</tr>';
+        var htmlRows = '';
+        for (var i = 0; i < items.length; i++) {
+          var x   = items[i];
+          var dev = escapeHtml(x.device || '');
+          var st  = String(x.status || '').toLowerCase();
+          var cls = (st === 'online') ? 'online' : ((st === 'offline') ? 'offline' : 'unknown');
+          var upd = escapeHtml(x.updatedAt || '');
+          htmlRows += '<tr>'
+                   + '<td>' + dev + '</td>'
+                   + '<td><span class="badge ' + cls + '">' + escapeHtml(x.status || '') + '</span></td>'
+                   + '<td>' + upd + '</td>'
+                   + '</tr>';
         }
-        tbody.innerHTML = html;
+        tbody.innerHTML = htmlRows;
       } catch (e) {
         console.error('Load error:', e);
-        const tbody = document.getElementById('rows');
+        var tbody = document.getElementById('rows');
         tbody.innerHTML = '<tr><td colspan="3">Error loading. Check console.</td></tr>';
       }
     }
@@ -194,18 +197,23 @@ const server = http.createServer((req, res) => {
     setInterval(load, 5000);
   </script>
 </body>
-</html>`);
+</html>`;
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+    return;
   }
 
   // Info page
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end(
-      `MQTT WebSocket broker running. Connect via ws(s)://<host>${WS_PATH}\n` +
-      `Publish device status to topic "devices/status" with JSON payload:\n` +
-      `{"device":"Device-01","status":"online","ts":<epochMillis>}\n` +
-      `View live table at GET /devices (auto-refresh 5s)`
+    res.end(
+      'MQTT WebSocket broker running. Connect via ws(s)://<host>' + WS_PATH + '\n' +
+      'Publish device status to topic "devices/status" with JSON payload:\n' +
+      '{"device":"Device-01","status":"online","ts":<epochMillis>}\n' +
+      'View live table at GET /devices (auto-refresh 5s)\n'
     );
+    return;
   }
 
   // Default 404
@@ -226,4 +234,6 @@ server.on('request', morgan('dev'));
 server.listen(PORT, () => {
   console.log(`Broker + UI listening on PORT=${PORT}`);
   console.log(`WS MQTT endpoint: ws(s)://<your-host>${WS_PATH}`);
-   console.log(`View devices at GET /devices`);
+  console.log(`View devices at GET /devices`);
+});
+``
