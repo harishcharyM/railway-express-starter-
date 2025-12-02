@@ -266,7 +266,7 @@ wss.on('connection', (socket) => {
 });
 
 // Optional: HTTP request logging
-server.on('request', morgan('dev'));
+//server.on('request', morgan('dev'));
 
 server.listen(PORT, () => {
   console.log(`Broker + UI listening on PORT=${PORT}`);
