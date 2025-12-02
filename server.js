@@ -1,40 +1,48 @@
 
 // server.js
-// MQTT broker (Aedes) over WebSockets + HTTP UI that auto-refreshes device statuses every 5 seconds.
+// MQTT broker (Aedes) over WebSockets + HTTP UI with an in-memory device registry.
+// Devices are appended when first seen, kept forever, and auto-marked OFFLINE if stale.
 //
 // Endpoints:
-// - GET  /              : Info page
+// - GET  /              : Info
 // - GET  /health        : Health check
-// - GET  /devices       : Auto-refreshing HTML table of device statuses
-// - GET  /api/devices   : JSON ({ items: [{device, status, updatedAt}], count })
+// - GET  /devices       : Auto-refreshing HTML table (every 5s)
+// - GET  /api/devices   : JSON { items: [{device,status,updatedAt,lastSeen,firstSeen}], count }
 // WebSocket MQTT endpoint: ws(s)://<host>/mqtt
 //
 // MQTT messages:
-// - Expect topic: "devices/status"
-// - Payload (preferred JSON): { "device": "Device-01", "status": "online", "ts": 1733055000000 }
-// - Fallback text format supported: "Device-01,online" or "Device-01:online"
+// - Topic: "devices/status"
+// - Payload JSON: { "device": "Device-01", "status": "online", "ts": 1733055000000 }
+//   (Fallback plain: "Device-01,online")
 
 require('dotenv').config();
 
-const http   = require('http');      // built-in HTTP server
-const ws     = require('ws');        // WebSocket server
-const aedes  = require('aedes')();   // MQTT broker
-const morgan = require('morgan');    // HTTP request logging (optional)
+const http   = require('http');
+const ws     = require('ws');
+const aedes  = require('aedes')();
+const morgan = require('morgan');
 
-const PORT    = process.env.PORT || 3000; // Railway injects PORT
+const PORT    = process.env.PORT || 3000;
 const WS_PATH = '/mqtt';
 
-// ---------------- In-memory device registry ----------------
-// deviceStatus: { [deviceName]: { status: 'online'|'offline'|string, updatedAt: ISOString } }
-const deviceStatus = Object.create(null);
-const MAX_DEVICES  = 1000;
+// ---- Auto-offline threshold ----
+// If a device hasn't sent in STALE_MS, it is marked "offline".
+const STALE_MS = Number(process.env.STALE_MS || 30000); // 30s default
 
-// Helper: escape HTML for safe rendering
+// ---------------- In-memory device registry ----------------
+// deviceStatus: {
+//   [deviceName]: {
+//     status: 'online' | 'offline' | string,
+//     firstSeen: ISOString,
+//     lastSeen: ISOString,
+//     updatedAt: ISOString  // last time we updated "status" (could be same as lastSeen or when marked offline)
+//   }
+// }
+const deviceStatus = Object.create(null);
+
+// Helper: escape HTML
 function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ---------------- MQTT broker events ----------------
@@ -53,8 +61,7 @@ aedes.on('subscribe', (subs, client) => {
 
 // Capture client-origin publishes and update registry
 aedes.on('publish', (packet, client) => {
-  // Only client-origin publishes (skip broker-origin to avoid loops)
-  if (!client) return;
+  if (!client) return; // skip broker-origin
 
   const topic      = packet?.topic || '';
   const payloadStr = packet?.payload ? packet.payload.toString() : '';
@@ -78,18 +85,19 @@ aedes.on('publish', (packet, client) => {
     }
 
     if (device && status) {
-      deviceStatus[device] = {
-        status,
-        updatedAt: new Date(ts ? Number(ts) : Date.now()).toISOString()
-      };
-
-      // Keep registry size bounded
-      const names = Object.keys(deviceStatus);
-      if (names.length > MAX_DEVICES) {
-        names.sort((a, b) =>
-          deviceStatus[a].updatedAt < deviceStatus[b].updatedAt ? -1 : 1
-        );
-        delete deviceStatus[names[0]];
+      const nowIso = new Date(ts ? Number(ts) : Date.now()).toISOString();
+      // Append if new, else update
+      if (!deviceStatus[device]) {
+        deviceStatus[device] = {
+          status,            // as sent by the device ("online"/"offline"/etc.)
+          firstSeen: nowIso, // first time we ever saw this device
+          lastSeen:  nowIso, // last message time
+          updatedAt: nowIso  // last time we updated status field
+        };
+      } else {
+        deviceStatus[device].status    = status;
+        deviceStatus[device].lastSeen  = nowIso;
+        deviceStatus[device].updatedAt = nowIso;
       }
 
       console.log(`[MQTT] ${client.id} -> devices/status: ${device} = ${status}`);
@@ -99,32 +107,50 @@ aedes.on('publish', (packet, client) => {
   }
 });
 
+// ---------------- Auto-offline background task ----------------
+// Every 5 seconds, mark any stale device as "offline"
+// (we DO NOT delete devices; they remain listed)
+setInterval(() => {
+  const now = Date.now();
+  for (const [name, info] of Object.entries(deviceStatus)) {
+    const last = Date.parse(info.lastSeen || info.updatedAt || info.firstSeen || new Date().toISOString());
+    const stale = isNaN(last) ? true : (now - last > STALE_MS);
+    if (stale && info.status !== 'offline') {
+      info.status    = 'offline';
+      info.updatedAt = new Date().toISOString();
+      // Note: we do not change lastSeen here; lastSeen remains the time of the last incoming message.
+    }
+  }
+}, 5000);
+
 // ---------------- HTTP server: UI + API + health ----------------
 const server = http.createServer((req, res) => {
-  // Health check
+  // Health
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
+    res.end(JSON.stringify({ status: 'ok', staleMs: STALE_MS }));
     return;
   }
 
-  // JSON API: current device statuses
+  // JSON API
   if (req.method === 'GET' && req.url === '/api/devices') {
     const items = Object.entries(deviceStatus).map(([name, info]) => ({
-      device: name,
-      status: info.status,
-      updatedAt: info.updatedAt
+      device:    name,
+      status:    info.status,
+      updatedAt: info.updatedAt,
+      lastSeen:  info.lastSeen,
+      firstSeen: info.firstSeen
     }));
     res.writeHead(200, {
       'Content-Type': 'application/json'
-      // If you serve /devices from another host, enable CORS:
+      // If UI is on another host, you can enable CORS:
       // ,'Access-Control-Allow-Origin': '*'
     });
     res.end(JSON.stringify({ items, count: items.length }));
     return;
   }
 
-  // HTML UI: auto-refreshing table (5 seconds)
+  // UI (auto-refresh every 5s)
   if (req.method === 'GET' && req.url === '/devices') {
     const html =
 `<!doctype html>
@@ -135,7 +161,7 @@ const server = http.createServer((req, res) => {
   <title>Device Live Status</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
-    table { border-collapse: collapse; width: 100%; max-width: 840px; }
+    table { border-collapse: collapse; width: 100%; max-width: 980px; }
     th, td { border: 1px solid #ddd; padding: 8px; }
     th { background: #f3f3f3; text-align: left; }
     .badge { padding: 2px 8px; border-radius: 999px; font-size: 0.9rem; }
@@ -143,17 +169,24 @@ const server = http.createServer((req, res) => {
     .offline { background: #ffd7d7; color: #6d1111; }
     .unknown { background: #eee;    color: #333; }
     .muted { color: #666; font-size: 0.9rem; }
+    code { background: #0001; padding: 2px 4px; border-radius: 4px; }
   </style>
 </head>
 <body>
   <main>
     <h1>Device Live Status</h1>
-    <p class="muted">Auto-refreshes every 5 seconds</p>
+    <p class="muted">Auto-refreshes every 5 seconds • Stale threshold: ${STALE_MS} ms</p>
     <table id="tbl">
       <thead>
-        <tr><th>Device</th><th>Status</th><th>Last Update (UTC)</th></tr>
+        <tr>
+          <th>Device</th>
+          <th>Status</th>
+          <th>Last Update (UTC)</th>
+          <th>Last Seen (UTC)</th>
+          <th>First Seen (UTC)</th>
+        </tr>
       </thead>
-      <tbody id="rows"><tr><td colspan="3">Loading…</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="5">Loading…</td></tr></tbody>
     </table>
   </main>
   <script>
@@ -169,7 +202,7 @@ const server = http.createServer((req, res) => {
         const tbody = document.getElementById('rows');
 
         if (items.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="3">No data yet. Waiting for MQTT publishes…</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="5">No devices yet. Publish to topic <code>devices/status</code> to register.</td></tr>';
           return;
         }
 
@@ -180,17 +213,21 @@ const server = http.createServer((req, res) => {
           var st  = String(x.status || '').toLowerCase();
           var cls = (st === 'online') ? 'online' : ((st === 'offline') ? 'offline' : 'unknown');
           var upd = escapeHtml(x.updatedAt || '');
+          var lst = escapeHtml(x.lastSeen || '');
+          var fst = escapeHtml(x.firstSeen || '');
           htmlRows += '<tr>'
                    + '<td>' + dev + '</td>'
                    + '<td><span class="badge ' + cls + '">' + escapeHtml(x.status || '') + '</span></td>'
                    + '<td>' + upd + '</td>'
+                   + '<td>' + lst + '</td>'
+                   + '<td>' + fst + '</td>'
                    + '</tr>';
         }
         tbody.innerHTML = htmlRows;
       } catch (e) {
         console.error('Load error:', e);
         var tbody = document.getElementById('rows');
-        tbody.innerHTML = '<tr><td colspan="3">Error loading. Check console.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5">Error loading. Check console.</td></tr>';
       }
     }
     load();
@@ -198,7 +235,6 @@ const server = http.createServer((req, res) => {
   </script>
 </body>
 </html>`;
-
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
     return;
@@ -211,12 +247,13 @@ const server = http.createServer((req, res) => {
       'MQTT WebSocket broker running. Connect via ws(s)://<host>' + WS_PATH + '\n' +
       'Publish device status to topic "devices/status" with JSON payload:\n' +
       '{"device":"Device-01","status":"online","ts":<epochMillis>}\n' +
-      'View live table at GET /devices (auto-refresh 5s)\n'
+      'UI: GET /devices • API: GET /api/devices • Health: GET /health\n' +
+      'Stale threshold (auto-offline): ' + STALE_MS + ' ms\n'
     );
     return;
   }
 
-  // Default 404
+  // 404
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not found');
 });
@@ -233,7 +270,5 @@ server.on('request', morgan('dev'));
 
 server.listen(PORT, () => {
   console.log(`Broker + UI listening on PORT=${PORT}`);
-  console.log(`WS MQTT endpoint: ws(s)://<your-host>${WS_PATH}`);
+  console.log(`WS  console.log(`WS MQTT endpoint: ws(s)://<your-host>${WS_PATH}`);
   console.log(`View devices at GET /devices`);
-});
-``
