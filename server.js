@@ -476,7 +476,7 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------------- WebSocket endpoint for MQTT ----------------
-constconst wss = new ws.Server({ server, path: WS_PATH });
+const wss = new ws.Server({ server, path: WS_PATH });
 wss.on('connection', (socket) => {
   const stream = ws.createWebSocketStream(socket);
   aedes.handle(stream);
