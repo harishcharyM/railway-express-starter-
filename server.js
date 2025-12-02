@@ -1,43 +1,48 @@
 
 // server.js
-// MQTT broker (Aedes) over WebSockets + HTTP UI with an in-memory device registry.
-// New: Host -> Device command flow with /control page and POST /api/command,
-// publishes payload "<device_name>:<status>" to topic "devices/command".
+// MQTT broker (Aedes) over WebSockets + HTTP UI:
+// - Landing page "/" with links to /devices and /control (open in new tab)
+// - /devices: auto-refreshing table showing device status (online/offline)
+// - /control: per-device toggle + manual command; publishes "<device>:<on|off>" to MQTT
+// - /api/devices: JSON list of devices
+// - /api/command: publish a command to MQTT (devices/command)
+// - /health: health endpoint
 //
-// Endpoints:
-// - GET  /                 : Info
-// - GET  /health           : Health check
-// - GET  /devices          : Auto-refreshing table of device statuses (every 5s)
-// - GET  /control          : Control UI (toggle per device + Send button)
-// - GET  /api/devices      : JSON { items: [{device,status,updatedAt,lastSeen,firstSeen}], count }
-// - POST /api/command      : Body { device, status } -> publishes "<device>:<status>" to MQTT
-// WebSocket MQTT endpoint: ws(s)://<host>/mqtt
+// MQTT topics:
+// - Ingest: "devices/status"
+//   Payload preferred: JSON { "device": "Device-01", "status": "online", "ts": <epochMillis> }
+//   Fallback: "Device-01,online" or "Device-01:online"
+// - Commands (host->device): "devices/command"
+//   Payload: "<device>:<on|off>"
 //
-// MQTT messages:
-// - Device status topic: "devices/status"
-//   Payload JSON: { "device": "Device-01", "status": "online", "ts": 1733055000000 }
-//   Fallback plain: "Device-01,online"
-// - Host commands topic: "devices/command"
-//   Payload plain: "<device_name>:<status>"  e.g., "Device-01:on" or "Device-03:off"
+// NOTE: In-memory registry resets on restart/redeploy. For persistence, use Redis/Postgres.
 
 require('dotenv').config();
 
-const http   = require('http');
-const ws     = require('ws');
-const aedes  = require('aedes')();
-const morgan = require('morgan');
+const http   = require('http');      // Core HTTP
+const ws     = require('ws');        // WebSocket server
+const aedes  = require('aedes')();   // MQTT broker
+const morgan = require('morgan');    // HTTP request logger (middleware style)
 
-const PORT          = process.env.PORT || 3000;
+const PORT          = process.env.PORT || 3000;      // Railway injects PORT
 const WS_PATH       = '/mqtt';
 const COMMAND_TOPIC = process.env.COMMAND_TOPIC || 'devices/command';
 
-// ---- Auto-offline threshold ----
-const STALE_MS = Number(process.env.STALE_MS || 30000); // mark offline if no update in 30s
+// Auto-offline logic: mark device as offline if stale
+const STALE_MS = Number(process.env.STALE_MS || 30000); // default 30s
 
 // ---------------- In-memory device registry ----------------
-const deviceStatus = Object.create(null); // Map: device -> { status, firstSeen, lastSeen, updatedAt }
+// deviceStatus: {
+//   [deviceName]: {
+//     status: 'online'|'offline'|string,
+//     firstSeen: ISOString,
+//     lastSeen: ISOString,   // last incoming message time
+     // updatedAt: ISOString  // last time we changed "status" (incoming or auto-offline)
+     // }
+// }
+const deviceStatus = Object.create(null);
 
-// Helper: escape HTML and make safe ids
+// Helpers
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -49,24 +54,28 @@ function safeId(s) {
 aedes.on('client', (client) => {
   console.log(`[MQTT] client connected: ${client?.id || '(no-id)'}`);
 });
+
 aedes.on('clientDisconnect', (client) => {
   console.log(`[MQTT] client disconnected: ${client?.id || '(no-id)'}`);
 });
+
 aedes.on('subscribe', (subs, client) => {
   const topics = Array.isArray(subs) ? subs.map(s => s.topic).join(', ') : String(subs);
   console.log(`[MQTT] ${client?.id} subscribed: ${topics}`);
 });
 
-// Device status ingest
+// Ingest device status messages
 aedes.on('publish', (packet, client) => {
-  if (!client) return; // skip broker-origin publishes
+  // Only handle client-origin publishes (skip broker-origin)
+  if (!client) return;
 
   const topic      = packet?.topic || '';
   const payloadStr = packet?.payload ? packet.payload.toString() : '';
 
   if (topic === 'devices/status') {
     let device, status, ts;
-    // Try JSON
+
+    // Try JSON first
     try {
       const obj = JSON.parse(payloadStr);
       device = String(obj.device || '').trim();
@@ -84,10 +93,12 @@ aedes.on('publish', (packet, client) => {
     if (device && status) {
       const nowIso = new Date(ts ? Number(ts) : Date.now()).toISOString();
       if (!deviceStatus[device]) {
+        // Append new device
         deviceStatus[device] = {
           status, firstSeen: nowIso, lastSeen: nowIso, updatedAt: nowIso
         };
       } else {
+        // Update existing
         deviceStatus[device].status    = status;
         deviceStatus[device].lastSeen  = nowIso;
         deviceStatus[device].updatedAt = nowIso;
@@ -100,6 +111,8 @@ aedes.on('publish', (packet, client) => {
 });
 
 // ---------------- Auto-offline background task ----------------
+// Every 5s, mark any device "offline" if (now - lastSeen) > STALE_MS.
+// We DO NOT delete devices; they remain listed.
 setInterval(() => {
   const now = Date.now();
   for (const [name, info] of Object.entries(deviceStatus)) {
@@ -108,19 +121,19 @@ setInterval(() => {
     if (stale && info.status !== 'offline') {
       info.status    = 'offline';
       info.updatedAt = new Date().toISOString();
-      // lastSeen remains as the time of the last incoming message
+      // lastSeen remains the time of the last incoming message
     }
   }
 }, 5000);
 
-// ---------------- HTTP server with Morgan wrapper ----------------
+// ---------------- HTTP server (with Morgan wrapper) ----------------
 const logger = morgan('dev');
 
 const server = http.createServer((req, res) => {
   // Let Morgan log first; provide a no-op next for plain http
   logger(req, res, async () => {
 
-    // Parse JSON body for POST /api/command (only when needed)
+    // Util: read JSON body for POST /api/command
     async function readJsonBody() {
       return new Promise((resolve) => {
         let body = '';
@@ -135,28 +148,94 @@ const server = http.createServer((req, res) => {
       });
     }
 
-    // Health
+    // -------- Landing page "/" (links open in new tab) --------
+    if (req.method === 'GET' && req.url === '/') {
+      const html =
+`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Main Host • Dashboard</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
+    main { max-width: 720px; margin: 0 auto; }
+    h1   { margin-bottom: 0.5rem; }
+    p    { color: #666; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 1rem; }
+    .card {
+      border: 1px solid #ddd; border-radius: 8px; padding: 16px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .card h2 { margin: 0; font-size: 1.2rem; }
+    .card p  { margin: 0; font-size: 0.95rem; color: #555; }
+    .card a {
+      align-self: flex-start;
+      display: inline-block; padding: 6px 12px; border-radius: 6px;
+      background: #0b78ff; color: #fff; text-decoration: none;
+    }
+    .card a:hover { background: #075fcc; }
+    .muted { color: #777; font-size: 0.9rem; }
+    code { background: #0001; padding: 2px 4px; border-radius: 4px; }
+    ul { margin-top: 1rem; }
+    ul li { margin: 4px 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Main Host</h1>
+    <p class="muted">Use the links below. Each opens in a <strong>new tab</strong>.</p>
+    <div class="grid">
+      <div class="card">
+        <h2>Devices</h2>
+        <p>Live device table (auto-refresh every 5s). Shows <code>online/offline</code> based on last seen.</p>
+        /devicesOpen Devices</a>
+      </div>
+      <div class="card">
+        <h2>Control</h2>
+        <p>Send <code>&lt;device&gt;:&lt;on|off&gt;</code> commands via toggle per device or manual input.</p>
+        <a href="/control" target="_blank" rel="  </div>
+
+    <h3>Quick endpoints</h3>
+    <ul>
+      <li>/health/health</a></li>
+      <li><a href="/api/devices" target="_blank" rel="
+    <p class="muted">MQTT WebSocket endpoint: <code>ws(s)://&lt;host&gt;${WS_PATH}</code></p>
+  </main>
+</body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    // -------- Health --------
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok', staleMs: STALE_MS, commandTopic: COMMAND_TOPIC }));
       return;
     }
 
-    // Devices API
+    // -------- Devices API --------
     if (req.method === 'GET' && req.url === '/api/devices') {
       const items = Object.entries(deviceStatus).map(([name, info]) => ({
-        device: name, status: info.status, updatedAt: info.updatedAt, lastSeen: info.lastSeen, firstSeen: info.firstSeen
+        device: name,
+        status: info.status,
+        updatedAt: info.updatedAt,
+        lastSeen:  info.lastSeen,
+        firstSeen: info.firstSeen
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ items, count: items.length }));
       return;
     }
 
-    // Command API: { device, status } -> publish "<device>:<status>"
+    // -------- Command API: { device, status } -> publish "<device>:<on|off>" --------
     if (req.method === 'POST' && req.url === '/api/command') {
-      const body = await readJsonBody();
+      const body   = await readJsonBody();
       const device = String(body.device || '').trim();
-      const status = String(body.status || '').trim().toLowerCase(); // normalize to 'on'/'off'
+      const status = String(body.status || '').trim().toLowerCase(); // 'on'|'off'
 
       if (!device || !status || !['on', 'off'].includes(status)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -178,7 +257,7 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // Devices UI (auto-refresh every 5s)
+    // -------- Devices UI (auto-refresh every 5s) --------
     if (req.method === 'GET' && req.url === '/devices') {
       const html =
 `<!doctype html>
@@ -204,7 +283,7 @@ const server = http.createServer((req, res) => {
   <main>
     <h1>Device Live Status</h1>
     <p class="muted">Auto-refreshes every 5 seconds • Stale threshold: ${STALE_MS} ms</p>
-    <p>/controlGo to Control</a></p>
+    <p>/controlOpen Control</a></p>
     <table id="tbl">
       <thead>
         <tr>
@@ -227,13 +306,15 @@ const server = http.createServer((req, res) => {
         const data = await res.json();
         const items = Array.isArray(data.items) ? data.items : [];
         const tbody = document.getElementById('rows');
+
         if (items.length === 0) {
           tbody.innerHTML = '<tr><td colspan="5">No devices yet. Publish to topic <code>devices/status</code> to register.</td></tr>';
           return;
         }
+
         var htmlRows = '';
         for (var i = 0; i < items.length; i++) {
-          var x = items[i];
+          var x   = items[i];
           var dev = escapeHtml(x.device || '');
           var st  = String(x.status || '').toLowerCase();
           var cls = (st === 'online') ? 'online' : ((st === 'offline') ? 'offline' : 'unknown');
@@ -265,7 +346,7 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // Control UI (toggle beside each device + Send button)
+    // -------- Control UI (toggle per device + manual send) --------
     if (req.method === 'GET' && req.url === '/control') {
       const html =
 `<!doctype html>
@@ -284,13 +365,15 @@ const server = http.createServer((req, res) => {
     .row-controls { display: flex; gap: 8px; align-items: center; }
     #msg { margin-top: 1rem; color: #175217; }
     #err { margin-top: 1rem; color: #6d1111; }
+    a.button { display:inline-block; padding:8px 14px; background:#0b78ff; color:#fff; border-radius:6px; text-decoration:none; }
+    a.button:hover { background:#075fcc; }
   </style>
 </head>
 <body>
   <main>
     <h1>Device Control</h1>
-    <p class="muted">Toggle <strong>On/Off</strong> next to a device and click <strong>Send</strong>. Payload format: <code>device_name:status</code></p>
-    <p>/devicesBack to Status</a></p>
+    <p class="muted">Toggle <strong>On/Off</strong> next to a device and click <strong>Send</strong>. Payload format: <code>device_name:on|off</code></p>
+    <p>/devicesOpen Devices</a></p>
     <table id="tbl">
       <thead><tr><th>Device</th><th>Current Status</th><th>Control</th><th>Action</th></tr></thead>
       <tbody id="rows"><tr><td colspan="4">Loading…</td></tr></tbody>
@@ -307,6 +390,7 @@ const server = http.createServer((req, res) => {
   </main>
   <script>
     function escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
     async function loadTable() {
       const tbody = document.getElementById('rows');
       try {
@@ -385,32 +469,22 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // Info page
-    if (req.method === 'GET' && req.url === '/') {
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end(
-        'MQTT WebSocket broker running. Connect via ws(s)://<host>' + WS_PATH + '\n' +
-        'Device status topic: "devices/status" (JSON {"device","status","ts"})\n' +
-        'Command topic: "' + COMMAND_TOPIC + '" with payload "<device>:<on|off>"\n' +
-        'Status UI: GET /devices • Control UI: GET /control • Health: GET /health\n'
-      );
-      return;
-    }
-
-    // 404
+    // -------- 404 fallback --------
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found');
   });
 });
 
 // ---------------- WebSocket endpoint for MQTT ----------------
-const wss = new ws.Server({ server, path: WS_PATH });
+constconst wss = new ws.Server({ server, path: WS_PATH });
 wss.on('connection', (socket) => {
   const stream = ws.createWebSocketStream(socket);
   aedes.handle(stream);
 });
 
+// Start server
 server.listen(PORT, () => {
   console.log(`Broker + UI listening on PORT=${PORT}`);
   console.log('WS MQTT endpoint: ws(s)://<your-host>' + WS_PATH);
+  console.log('Landing: GET / • Status: GET /devices • Control: GET /control • Health: GET /health')
 });
