@@ -270,6 +270,5 @@ server.on('request', morgan('dev'));
 
 server.listen(PORT, () => {
   console.log(`Broker + UI listening on PORT=${PORT}`);
-  console.log(`WS  console.log(`WS MQTT endpoint: ws(s)://<your-host>${WS_PATH}`);
   console.log(`View devices at GET /devices`);
 });
