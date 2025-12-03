@@ -248,6 +248,7 @@ const server = http.createServer((req, res) => {
     }
 
     // ---------- LOGIN (POST) ----------
+    console.log("checking the creds");
     if (req.method === 'POST' && pathname === '/login') {
       const form = await readFormBody(req);
       const next = String(form.next ?? '/');
