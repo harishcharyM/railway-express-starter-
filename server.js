@@ -253,7 +253,7 @@ const server = http.createServer((req, res) => {
       const next = String(form.next ?? '/');
       const userIn = String(form.user ?? '').trim();
       const passIn = String(form.pass ?? '').trim();
-      
+      console.log("entering userIn and Password ");
       if (userIn === ADMIN_USER && passIn === ADMIN_PASS) {
         console.log("userIn and Password matched");
         const token = makeSession(userIn);
