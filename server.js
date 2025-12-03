@@ -1,85 +1,135 @@
 
-// server.js
-// MQTT broker (Aedes) over WebSockets + HTTP UI:
-// - Landing page "/" with links to /devices and /control (open in new tab)
-// - /devices: auto-refreshing table showing device status (online/offline)
-// - /control: per-device toggle + manual command; publishes "<device>:<on|off>" to MQTT
-// - /api/devices: JSON list of devices
-// - /api/command: publish a command to MQTT (devices/command)
-// - /health: health endpoint
-//
-// MQTT topics:
-// - Ingest: "devices/status"
-//   Payload preferred: JSON { "device": "Device-01", "status": "online", "ts": <epochMillis> }
-//   Fallback: "Device-01,online" or "Device-01:online"
-// - Commands (host->device): "devices/command"
-//   Payload: "<device>:<on|off>"
-//
-// NOTE: In-memory registry resets on restart/redeploy. For persistence, use Redis/Postgres.
+// server.js (with login/auth)
+// MQTT broker (Aedes) + WebSockets + HTTP UI + Cookie-based login
 
 require('dotenv').config();
-const http = require('http');         // Core HTTP
-const ws = require('ws');             // WebSocket server
-const aedes = require('aedes')();     // MQTT broker
-const morgan = require('morgan');     // HTTP request logger (middleware style)
 
-const PORT = process.env.PORT ?? 3000;             // Railway injects PORT
-const WS_PATH = '/mqtt';
-const COMMAND_TOPIC = process.env.COMMAND_TOPIC ?? 'devices/command';
+const http   = require('http');
+const ws     = require('ws');
+const aedes  = require('aedes')();
+const morgan = require('morgan');
+const crypto = require('crypto');
 
-// Auto-offline logic: mark device as offline if stale
-const STALE_MS = Number(process.env.STALE_MS ?? 30000); // default 30s
+// ---------- Config ----------
+const PORT            = process.env.PORT ?? 3000;
+const WS_PATH         = '/mqtt';
+const COMMAND_TOPIC   = process.env.COMMAND_TOPIC ?? 'devices/command';
+const STALE_MS        = Number(process.env.STALE_MS ?? 30000);
+const ADMIN_USER      = process.env.ADMIN_USER ?? 'admin';
+const ADMIN_PASS      = process.env.ADMIN_PASS ?? 'Harish@123'; // change me!
+const SESSION_SECRET  = process.env.SESSION_SECRET ?? 'Harish@123';
+const SESSION_MAX_AGE = Number(process.env.SESSION_MAX_AGE_MS ?? 8 * 60 * 60 * 1000); // 8h
+const COOKIE_SECURE   = String(process.env.COOKIE_SECURE ?? 'false') === 'true';
 
-// ---------------- In-memory device registry ----------------
-// deviceStatus: {
-//   [deviceName]: {
-//     status: 'online'|'offline'|string,
-//     firstSeen: ISOString,
-//     lastSeen: ISOString,   // last incoming message time
-//     updatedAt: ISOString   // last time we changed "status" (incoming or auto-offline)
-//   }
-// }
+// ---------- Device registry ----------
 const deviceStatus = Object.create(null);
 
-// Helpers
+// ---------- Helpers ----------
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 function safeId(s) {
   return String(s).replace(/[^a-zA-Z0-9_\-]/g, '_');
 }
+function parseCookies(req) {
+  const header = req.headers.cookie;
+  const out = Object.create(null);
+  if (!header) return out;
+  const parts = header.split(';');
+  for (const p of parts) {
+    const idx = p.indexOf('=');
+    if (idx < 0) continue;
+    const k = p.slice(0, idx).trim();
+    const v = p.slice(idx + 1).trim();
+    out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+function setCookie(res, name, value, options = {}) {
+  const attrs = [];
+  attrs.push(`${name}=${encodeURIComponent(value)}`);
+  attrs.push('Path=/');
+  attrs.push('HttpOnly');
+  attrs.push('SameSite=Lax');
+  if (COOKIE_SECURE) attrs.push('Secure');
+  if (options.maxAge != null) attrs.push(`Max-Age=${Math.floor(options.maxAge / 1000)}`);
+  if (options.expires) attrs.push(`Expires=${options.expires.toUTCString()}`);
+  res.setHeader('Set-Cookie', attrs.join('; '));
+}
+function clearCookie(res, name) {
+  res.setHeader('Set-Cookie', `${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${COOKIE_SECURE ? '; Secure' : ''}`);
+}
+function sign(b64) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(b64).digest('hex');
+}
+function makeSession(username) {
+  const payload = { u: username, exp: Date.now() + SESSION_MAX_AGE };
+  const b64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = sign(b64);
+  return `${b64}.${sig}`;
+}
+function checkSession(token) {
+  if (!token) return null;
+  const [b64, sig] = String(token).split('.');
+  if (!b64 || !sig) return null;
+  if (sign(b64) !== sig) return null;
+  try {
+    const obj = JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
+    if (!obj.exp || obj.exp < Date.now()) return null;
+    return obj.u;
+  } catch {
+    return null;
+  }
+}
+async function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      try { resolve(JSON.parse(body ?? '{}')); }
+      catch { resolve({}); }
+    });
+  });
+}
+async function readFormBody(req) {
+  // application/x-www-form-urlencoded
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      const params = new URLSearchParams(body);
+      const obj = {};
+      for (const [k, v] of params) obj[k] = v;
+      resolve(obj);
+    });
+  });
+}
 
-// ---------------- MQTT broker events ----------------
+// ---------- MQTT events ----------
 aedes.on('client', (client) => {
   console.log(`[MQTT] client connected: ${client?.id ?? '(no-id)'}`);
 });
-
 aedes.on('clientDisconnect', (client) => {
   console.log(`[MQTT] client disconnected: ${client?.id ?? '(no-id)'}`);
 });
-
 aedes.on('subscribe', (subs, client) => {
   const topics = Array.isArray(subs) ? subs.map(s => s.topic).join(', ') : String(subs);
   console.log(`[MQTT] ${client?.id} subscribed: ${topics}`);
 });
-
-// Ingest device status messages
 aedes.on('publish', (packet, client) => {
-  // Only handle client-origin publishes (skip broker-origin)
+  // Only handle client-origin publishes
   if (!client) return;
   const topic = packet?.topic ?? '';
   const payloadStr = packet?.payload ? packet.payload.toString() : '';
 
   if (topic === 'devices/status') {
     let device, status, ts;
-    // Try JSON first
     try {
       const obj = JSON.parse(payloadStr);
       device = String(obj.device ?? '').trim();
       status = String(obj.status ?? '').trim();
       ts = obj.ts;
     } catch {
-      // Fallback: "Device-01,online" or "Device-01:online"
       const parts = payloadStr.split(/[,:]/).map(s => s.trim());
       if (parts.length >= 2) {
         device = parts[0];
@@ -90,15 +140,8 @@ aedes.on('publish', (packet, client) => {
     if (device && status) {
       const nowIso = new Date(ts ? Number(ts) : Date.now()).toISOString();
       if (!deviceStatus[device]) {
-        // Append new device
-        deviceStatus[device] = {
-          status,
-          firstSeen: nowIso,
-          lastSeen: nowIso,
-          updatedAt: nowIso
-        };
+        deviceStatus[device] = { status, firstSeen: nowIso, lastSeen: nowIso, updatedAt: nowIso };
       } else {
-        // Update existing
         deviceStatus[device].status = status;
         deviceStatus[device].lastSeen = nowIso;
         deviceStatus[device].updatedAt = nowIso;
@@ -110,46 +153,137 @@ aedes.on('publish', (packet, client) => {
   }
 });
 
-// ---------------- Auto-offline background task ----------------
-// Every 5s, mark any device "offline" if (now - lastSeen) > STALE_MS.
-// We DO NOT delete devices; they remain listed.
+// ---------- Auto-offline ----------
 setInterval(() => {
   const now = Date.now();
   for (const [name, info] of Object.entries(deviceStatus)) {
-    const last =
-      Date.parse(info.lastSeen ?? info.updatedAt ?? info.firstSeen ?? new Date().toISOString());
+    const last = Date.parse(info.lastSeen ?? info.updatedAt ?? info.firstSeen ?? new Date().toISOString());
     const stale = isNaN(last) ? true : (now - last > STALE_MS);
     if (stale && info.status !== 'offline') {
       info.status = 'offline';
       info.updatedAt = new Date().toISOString();
-      // lastSeen remains the time of the last incoming message
     }
   }
 }, 5000);
 
-// ---------------- HTTP server (with Morgan wrapper) ----------------
+// ---------- HTTP server ----------
 const logger = morgan('dev');
 const server = http.createServer((req, res) => {
-  // Let Morgan log first; provide a no-op next for plain http
   logger(req, res, async () => {
 
-    // Util: read JSON body for POST /api/command
-    async function readJsonBody() {
-      return new Promise((resolve) => {
-        let body = '';
-        req.on('data', chunk => (body += chunk));
-        req.on('end', () => {
-          try {
-            resolve(JSON.parse(body ?? '{}'));
-          } catch {
-            resolve({});
-          }
-        });
-      });
+    // Parse URL
+    let urlObj;
+    try {
+      urlObj = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+    } catch {
+      urlObj = { pathname: req.url, searchParams: new URLSearchParams() };
+    }
+    const pathname = urlObj.pathname;
+
+    // ---- Authentication gate (protect everything except /login and /health) ----
+    const cookies = parseCookies(req);
+    const user = checkSession(cookies.sid);
+    const isPublic = (pathname === '/login' || pathname === '/health');
+
+    if (!user && !isPublic) {
+      // Redirect to login with ?next=
+      res.writeHead(302, { Location: `/login?next=${encodeURIComponent(req.url)}` });
+      res.end();
+      return;
     }
 
-    // ---------- Landing page "/" (links open in new tab) ----------
-    if (req.method === 'GET' && req.url === '/') {
+    // ---------- LOGIN (GET) ----------
+    if (req.method === 'GET' && pathname === '/login') {
+      const errMsg = urlObj.searchParams.get('error') ?? '';
+      const next = urlObj.searchParams.get('next') ?? '/';
+      const html =
+`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login • Main Host</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
+    main { max-width: 440px; margin: 0 auto; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+    .row { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+    label { font-weight: 600; }
+    input[type="text"], input[type="password"] { padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
+    button { padding: 10px 14px; border: none; border-radius: 6px; background: #0b78ff; color: #fff; cursor: pointer; }
+    button:hover { background: #075fcc; }
+    .err { color: #6d1111; margin-top: 8px; }
+    .muted { color: #666; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Sign in</h1>
+    <p class="muted">Use your admin credentials to access Devices & Control.</p>
+    <div class="card">
+      /login
+        <input type="hidden" name="next" value="${escapeHtml(next)}" />
+        <div class="row">
+          <label for="user">Username</label>
+          <input id="user" name="user" type="text" autocomplete="username" required />
+        </div>
+        <div class="row">
+          <label for="pass">Password</label>
+          <input id="pass" name="pass" type="password" autocomplete="current-password" required />
+        </div>
+        <div class="row">
+          <button type="submit">Login</button>
+        </div>
+        ${errMsg ? `<div class="err">${escapeHtml(errMsg)}</div>` : ''}
+      </form>
+    </div>
+    <p class="muted" style="margin-top:12px;">MQTT WebSocket endpoint: <code>ws(s)://&lt;host&gt;${WS_PATH}</code></p>
+  </main>
+</body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    // ---------- LOGIN (POST) ----------
+    if (req.method === 'POST' && pathname === '/login') {
+      const form = await readFormBody(req);
+      const next = String(form.next ?? '/');
+      const userIn = String(form.user ?? '').trim();
+      const passIn = String(form.pass ?? '').trim();
+
+      if (userIn === ADMIN_USER && passIn === ADMIN_PASS) {
+        const token = makeSession(userIn);
+        setCookie(res, 'sid', token, { maxAge: SESSION_MAX_AGE });
+        res.writeHead(302, { Location: next });
+        res.end();
+        return;
+      } else {
+        res.writeHead(302, { Location: `/login?error=${encodeURIComponent('Invalid credentials')}&next=${encodeURIComponent(next)}` });
+        res.end();
+        return;
+      }
+    }
+
+    // ---------- LOGOUT ----------
+    if (req.method === 'GET' && pathname === '/logout') {
+      clearCookie(res, 'sid');
+      res.writeHead(302, { Location: '/login' });
+      res.end();
+      return;
+    }
+
+    // ---------- Health ----------
+    if (req.method === 'GET' && pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', staleMs: STALE_MS, commandTopic: COMMAND_TOPIC }));
+      return;
+    }
+
+    // ---------- Landing (protected) ----------
+    if (req.method === 'GET' && pathname === '/') {
       const html =
 `<!doctype html>
 <html lang="en">
@@ -164,18 +298,12 @@ const server = http.createServer((req, res) => {
     h1 { margin-bottom: 0.5rem; }
     p { color: #666; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 1rem; }
-    .card {
-      border: 1px solid #ddd; border-radius: 8px; padding: 16px;
-      display: flex; flex-direction: column; gap: 8px;
-    }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 8px; cursor: pointer; }
     .card h2 { margin: 0; font-size: 1.2rem; }
     .card p { margin: 0; font-size: 0.95rem; color: #555; }
-    .card a {
-      align-self: flex-start;
-      display: inline-block; padding: 6px 12px; border-radius: 6px;
-      background: #0b78ff; color: #fff; text-decoration: none;
-    }
+    .card a { align-self: flex-start; display: inline-block; padding: 6px 12px; border-radius: 6px; background: #0b78ff; color: #fff; text-decoration: none; }
     .card a:hover { background: #075fcc; }
+    .row { display:flex; gap:8px; align-items:center; margin-top: 12px; }
     .muted { color: #777; font-size: 0.9rem; }
     code { background: #0001; padding: 2px 4px; border-radius: 4px; }
     ul { margin-top: 1rem; }
@@ -184,17 +312,17 @@ const server = http.createServer((req, res) => {
 </head>
 <body>
   <main>
-    <h1>Welcome <strong>Harish</strong></h1>
-    <p class="muted">Use the links below. Each opens in a <strong>new tab</strong>.</p>
+    <h1>Welcome <strong>${escapeHtml(user)}</strong></h1>
+    <p class="muted">Click a card or the button to open the page.</p>
 
     <div class="grid">
-      <div class="card">
+      /devices
         <h2>Devices</h2>
         <p>Live device table (auto-refresh every 5s). Shows <code>online/offline</code> based on last seen.</p>
         /devicesOpen Devices</a>
       </div>
 
-      <div class="card">
+      /control
         <h2>Control</h2>
         <p>Send <code>&lt;device&gt;:&lt;on/off&gt;</code> commands via toggle per device or manual input.</p>
         /controlOpen Control</a>
@@ -207,8 +335,22 @@ const server = http.createServer((req, res) => {
       <li>/api/devices/api/devices</a></li>
     </ul>
 
-    <p class="muted">MQTT WebSocket endpoint: <code>ws(s)://&lt;host&gt;${WS_PATH}</code></p>
+    <div class="row">
+      /logoutLogout</a>
+      <span class="muted">MQTT WebSocket endpoint: <code>ws(s)://&lt;host&gt;${WS_PATH}</code></span>
+    </div>
   </main>
+
+  <script>
+    // Make entire card clickable (same tab)
+    document.querySelectorAll('.card[data-href]').forEach(card => {
+      card.addEventListener('click', (e) => {
+        if (e.target.tagName.toLowerCase() === 'a') return;
+        const href = card.getAttribute('data-href');
+        if (href) window.location.href = href;
+      });
+    });
+  </script>
 </body>
 </html>`;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -216,15 +358,8 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // ---------- Health ----------
-    if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', staleMs: STALE_MS, commandTopic: COMMAND_TOPIC }));
-      return;
-    }
-
-    // ---------- Devices API ----------
-    if (req.method === 'GET' && req.url === '/api/devices') {
+    // ---------- Devices API (protected) ----------
+    if (req.method === 'GET' && pathname === '/api/devices') {
       const items = Object.entries(deviceStatus).map(([name, info]) => ({
         device: name,
         status: info.status,
@@ -237,9 +372,9 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // ---------- Command API: { device, status } -> publish "<device>:<on|off>" ----------
-    if (req.method === 'POST' && req.url === '/api/command') {
-      const body = await readJsonBody();
+    // ---------- Command API (protected) ----------
+    if (req.method === 'POST' && pathname === '/api/command') {
+      const body = await readJsonBody(req);
       const device = String(body.device ?? '').trim();
       const status = String(body.status ?? '').trim().toLowerCase(); // 'on'|'off'
 
@@ -263,8 +398,8 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // ---------- Devices UI (auto-refresh every 5s) ----------
-    if (req.method === 'GET' && req.url === '/devices') {
+    // ---------- Devices UI (protected) ----------
+    if (req.method === 'GET' && pathname === '/devices') {
       const html =
 `<!doctype html>
 <html lang="en">
@@ -291,7 +426,7 @@ const server = http.createServer((req, res) => {
   <main>
     <h1>Device Live Status</h1>
     <p class="muted">Auto-refreshes every 5 seconds • Stale threshold: ${STALE_MS} ms</p>
-    <p>/controlOpen Control</a></p>
+    <p>/controlOpen Control</a> • /Home</a> • /logoutLogout</a></p>
 
     <table id="tbl">
       <thead>
@@ -354,8 +489,8 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // ---------- Control UI (toggle per device + manual send) ----------
-    if (req.method === 'GET' && req.url === '/control') {
+    // ---------- Control UI (protected) ----------
+    if (req.method === 'GET' && pathname === '/control') {
       const html =
 `<!doctype html>
 <html lang="en">
@@ -380,8 +515,8 @@ const server = http.createServer((req, res) => {
 <body>
   <main>
     <h1>Device Control</h1>
-    <p class="muted">Toggle <strong>On/Off</strong> next to a device and click <strong>Send</strong>. Payload format: <code>device_name:on|off</code></p>
-    <p>/devicesOpen Devices</a></p>
+    <p class="muted">Toggle <strong>On/Off</strong> next to a device and click <strong>Send</strong>. Payload: <code>device_name:on|off</code></p>
+    <p>/devicesOpen Devices</a> • /Home</a> • /logoutLogout</a></p>
 
     <table id="tbl">
       <thead><tr><th>Device</th><th>Current Status</th><th>Control</th><th>Action</th></tr></thead>
@@ -400,7 +535,6 @@ const server = http.createServer((req, res) => {
 
   <script>
     function escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
     async function loadTable() {
       const tbody = document.getElementById('rows');
       try {
@@ -428,7 +562,6 @@ const server = http.createServer((req, res) => {
         }
         tbody.innerHTML = htmlRows;
 
-        // Wire buttons
         var buttons = document.getElementsByClassName('send-btn');
         for (var j = 0; j < buttons.length; j++) {
           buttons[j].addEventListener('click', async function(e) {
@@ -443,7 +576,6 @@ const server = http.createServer((req, res) => {
         tbody.innerHTML = '<tr><td colspan="4">Error loading. Check console.</td></tr>';
       }
     }
-
     async function sendCommand(device, status) {
       var msg = document.getElementById('msg');
       var err = document.getElementById('err');
@@ -462,14 +594,12 @@ const server = http.createServer((req, res) => {
         err.textContent = 'Failed: ' + e.message;
       }
     }
-
     document.getElementById('manual-send').addEventListener('click', async function() {
       var device = document.getElementById('manual-device').value.trim();
       var status = document.getElementById('manual-toggle').checked ? 'on' : 'off';
       if (!device) { alert('Enter device name'); return; }
       await sendCommand(device, status);
     });
-
     loadTable();
   </script>
 </body>
@@ -479,22 +609,22 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // ---------- 404 fallback ----------
+    // ---------- 404 ----------
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found');
   });
 });
 
-// ---------------- WebSocket endpoint for MQTT ----------------
+// ---------- WebSocket endpoint for MQTT ----------
 const wss = new ws.Server({ server, path: WS_PATH });
 wss.on('connection', (socket) => {
   const stream = ws.createWebSocketStream(socket);
   aedes.handle(stream);
 });
 
-// Start server
+// ---------- Start ----------
 server.listen(PORT, () => {
-  console.log(`Broker + UI listening on PORT=${PORT}`);
+  console.log(`Broker + UI + Login listening on PORT=${PORT}`);
   console.log('WS MQTT endpoint: ws(s)://<your-host>' + WS_PATH);
-  console.log('Landing: GET / • Status: GET /devices • Control: GET /control • Health: GET /health');
+  console.log('Landing: GET / • Status: GET /devices • Control: GET /control • Health: GET /health • Login: GET/POST /login • Logout: GET /logout');
 });
