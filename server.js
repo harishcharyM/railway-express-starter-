@@ -249,7 +249,7 @@ const server = http.createServer((req, res) => {
 
     // ---------- LOGIN (POST) ----------
     console.log("checking the creds");
-    if (req.method === 'POST' && pathname === '/login') {
+    if (req.method === 'GET' && pathname === '/login') {
       const form = await readFormBody(req);
       const next = String(form.next ?? '/');
       const userIn = String(form.user ?? '').trim();
