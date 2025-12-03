@@ -253,14 +253,16 @@ const server = http.createServer((req, res) => {
       const next = String(form.next ?? '/');
       const userIn = String(form.user ?? '').trim();
       const passIn = String(form.pass ?? '').trim();
-
+      
       if (userIn === ADMIN_USER && passIn === ADMIN_PASS) {
+        console.log("userIn and Password matched);
         const token = makeSession(userIn);
         setCookie(res, 'sid', token, { maxAge: SESSION_MAX_AGE });
         res.writeHead(302, { Location: next });
         res.end();
         return;
       } else {
+        console.log("userIn and Password Not matched);
         res.writeHead(302, { Location: `/login?error=${encodeURIComponent('Invalid credentials')}&next=${encodeURIComponent(next)}` });
         res.end();
         return;
